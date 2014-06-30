@@ -37,12 +37,14 @@ ADDRESSING_VERTICAL = 0x01
 ADDRESSING_PAGE = 0x02
 
 class SSD1306:
-	def __init__(self, pin_dc, pin_reset, spi_bus=0, spi_device=0):
+	def __init__(self, pin_dc, pin_reset, spi_bus=0, spi_device=0, buffer_pages=8, buffer_columns=128):
+		self.buffer_pages = buffer_pages
+		self.buffer_columns = buffer_columns
 		self.pin_reset = pin_reset
 		self.pin_dc = pin_dc
-		self.buffer = [0] * 1024
 		self.spi = spidev.SpiDev()
 		self.spi.open(spi_bus, spi_device)
+		self.clear()
 
 		GPIO.setmode(GPIO.BCM)
 		GPIO.setup(self.pin_dc, GPIO.OUT)
@@ -125,25 +127,25 @@ class SSD1306:
 
 	def horizontal_addressing(self, pageStart=0, pageEnd=7, columnStart=0, columnEnd=127):
 		self.command(COMMAND_ADDRESSING_MODE, ADDRESSING_HORIZONTAL)
-		self.command(COMMAND_ADDRESSING_PAGE, pageStart & 0x07, pageEnd & 0x07)
 		self.command(COMMAND_ADDRESSING_COLUMN, columnStart & 0x7F, columnEnd & 0x7F)
+		self.command(COMMAND_ADDRESSING_PAGE, pageStart & 0x07, pageEnd & 0x07)
 
 	def vertical_addressing(self, pageStart=0, pageEnd=7, columnStart=0, columnEnd=127):
 		self.command(COMMAND_ADDRESSING_MODE, ADDRESSING_VERTICAL)
-		self.command(COMMAND_ADDRESSING_PAGE, pageStart & 0x07, pageEnd & 0x07)
 		self.command(COMMAND_ADDRESSING_COLUMN, columnStart & 0x7F, columnEnd & 0x7F)
+		self.command(COMMAND_ADDRESSING_PAGE, pageStart & 0x07, pageEnd & 0x07)
 
 	def contrast(self, value):
-		self.command(COMMAND_CONTRAST, value & 0x7F)
+		self.command(COMMAND_CONTRAST, value & 0xFF)
 
 	def xy(self, x, y, status):
 		"""
 		Light a pixel on or off in the buffer
 		"""
 
-		page = y // 8
-		segbit = y % 8
-		pos = page*128 + x
+		page = y // self.buffer_pages
+		segbit = y % self.buffer_pages
+		pos = page*self.buffer_columns + x
 		segmod = 1 << segbit
 		if status:
 			self.buffer[pos] |= segmod
@@ -157,7 +159,10 @@ class SSD1306:
 
 		for p in range(0,8):
 			self.page_addressing(page=p, column=0)
-			self.data(self.buffer[p*128:(p+1)*128])
+			pstart = p*self.buffer_columns
+			pend = pstart + 128
+			self.data(list([0, 0]))
+			self.data(self.buffer[pstart:pend])
 
 	def text(self, x, y, string, size=3, space=1, font=font5x8.Font5x8, invert=False, background=False):
 		font_bytes = font.bytes
@@ -189,4 +194,75 @@ class SSD1306:
 		Clear the buffer
 		"""
 
-		self.buffer = [0] * 1024
+		buffersize = self.buffer_pages * self.buffer_columns
+		self.buffer = [0] * buffersize
+
+	def shift_left(self, n=1):
+		old_buffer = list(self.buffer)
+		self.buffer = []
+		for p in range(0,self.buffer_pages):
+			pstart = p*self.buffer_columns
+			pend = pstart + self.buffer_columns
+			self.buffer = self.buffer + old_buffer[pstart+n:pend] + old_buffer[pstart:pstart+n]
+
+	def shift_right(self, n=1):
+		old_buffer = list(self.buffer)
+		self.buffer = []
+		for p in range(0,self.buffer_pages):
+			pstart = p*self.buffer_columns
+			pend = pstart + self.buffer_columns
+			self.buffer = self.buffer + old_buffer[pend-n:pend] + old_buffer[pstart:pend-n]
+
+	def shift_up(self, n=1):
+		shift_page = n // 8
+		shift_seg = n % 8
+		if shift_page > 0:
+			old_buffer = self.buffer[:]
+			self.buffer = []
+			for p in range (0,self.buffer_pages):
+				old_p = (p + shift_page) % self.buffer_pages
+				pstart = old_p*self.buffer_columns
+				pend = pstart + self.buffer_columns
+				self.buffer = self.buffer + old_buffer[pstart:pend]
+		if shift_seg > 0:
+			old_buffer = self.buffer[:]
+			back_shift_seg = 8 - shift_seg
+			mask = 2**back_shift_seg - 1
+			back_mask = 0xFF - mask
+			for p in range (0,self.buffer_pages):
+				for c in range(0,self.buffer_columns):
+					pos = p * self.buffer_columns + c
+					next_p = (p + 1) % self.buffer_pages
+					next_pos = next_p * self.buffer_columns + c
+					self.buffer[pos] = (old_buffer[pos] >> shift_seg) & mask | (old_buffer[next_pos] << back_shift_seg) & back_mask
+
+	def shift_down(self, n=1):
+		shift_page = n // 8
+		shift_seg = n % 8
+		if shift_page > 0:
+			old_buffer = self.buffer[:]
+			self.buffer = []
+			for p in range (0,self.buffer_pages):
+				old_p = (self.buffer_pages + p - shift_page) % self.buffer_pages
+				pstart = old_p*self.buffer_columns
+				pend = pstart + self.buffer_columns
+				self.buffer = self.buffer + old_buffer[pstart:pend]
+		if shift_seg > 0:
+			old_buffer = self.buffer[:]
+			back_shift_seg = 8 - shift_seg
+			back_mask = 2**shift_seg - 1
+			mask = 0xFF - back_mask
+			for p in range (0,self.buffer_pages):
+				for c in range(0,self.buffer_columns):
+					pos = p * self.buffer_columns + c
+					next_p = (self.buffer_pages + p - 1) % self.buffer_pages
+					next_pos = next_p * self.buffer_columns + c
+					self.buffer[pos] = (old_buffer[pos] << shift_seg) & mask | (old_buffer[next_pos] >> back_shift_seg) & back_mask
+
+	def set_buffer_size(self,x,y):
+		self.buffer_pages = y // 8
+		if y % 8 > 0:
+			self.buffer_pages += 1
+                self.buffer_columns = x
+		self.clear()
+
